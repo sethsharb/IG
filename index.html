@@ -117,10 +117,9 @@
       continue;
     }
     const code = pm[2];
-    // Instagram's own media-redirect endpoint 302s straight to the real
-    // CDN jpg. images.weserv.nl was proxying this and mostly returning
-    // stale/cached 404s, so we hit Instagram directly instead.
-    const imgSrc = 'https://www.instagram.com/p/' + code + '/media/?size=l';
+    const imgSrc = 'https://images.weserv.nl/?url=' +
+      encodeURIComponent('instagram.com/p/' + code + '/media/?size=l') +
+      '&n=-1';
 
     items.push({ url, handle, imgSrc });
   }
