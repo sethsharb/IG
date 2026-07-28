@@ -33,9 +33,7 @@
   }
   .card{ break-inside:avoid; margin:0 0; background:#fff; border:1px solid #eee; border-radius:12px; overflow:hidden; box-shadow:0 1px 2px rgba(0,0,0,.04); }
   .thumb{ display:block; background:#eee; }
-  .thumb:empty{ aspect-ratio:1/1; }
   .thumb img{ display:block; width:100%; height:auto; }
-  .thumb.broken{ aspect-ratio:1/1; display:flex; align-items:center; justify-content:center; color:#999; font-size:12px; text-align:center; padding:10px; }
   .meta{ padding:8px 10px; font-size:14px; color:#555; display:flex; justify-content:space-between; align-items:center; gap:10px; }
   .meta a{ color:inherit; text-decoration:none; }
   .meta a:hover{ text-decoration:underline; }
@@ -53,6 +51,7 @@
 </div>
 
 <div class="masonry" id="grid" aria-live="polite"></div>
+<div id="sentinel" style="height:1px;"></div>
 <div id="notes" class="muted" style="margin-top:10px;"></div>
 
 <script>
@@ -68,21 +67,14 @@
     card.style.gridRowEnd = 'span ' + span;
   }
   function wireMasonryObservers(card){
-    // Recalculate when content changes size
+    // Card is only ever appended once its image has finished loading,
+    // so we can size it immediately and just watch for later changes.
     const ro = new ResizeObserver(() => resizeCard(card));
     ro.observe(card);
-    // Initial calc once images are loaded
-    const img = card.querySelector('img');
-    if (img) {
-      if (img.complete) resizeCard(card);
-      else img.addEventListener('load', () => resizeCard(card), { once:true });
-      img.addEventListener('error', () => resizeCard(card), { once:true });
-    } else {
-      resizeCard(card);
-    }
+    resizeCard(card);
   }
   const el = id => document.getElementById(id);
-  const COUNT = el('count'), GRID = el('grid'), GAP = el('gap'), NOTES = el('notes');
+  const COUNT = el('count'), GRID = el('grid'), GAP = el('gap'), NOTES = el('notes'), SENTINEL = el('sentinel');
 
   GAP.oninput = () =>
     document.documentElement.style.setProperty('--gap', GAP.value + 'px');
@@ -132,67 +124,44 @@
     items.push({ url, handle, imgSrc });
   }
 
-  COUNT.textContent = `Found ${items.length} posts (${withHandle} with handle, ${withoutHandle} without)`;
   if (withoutHandle && withHandle === 0) {
     NOTES.innerHTML = '<span class="warn">All entries appear to be missing a recognizable "@handle" token on each line. Make sure each line looks like:<br><code>https://www.instagram.com/p/XXXX/ @username</code></span>';
   }
 
-  // --- Throttled, scroll-triggered image loading ---
-  // Only a few thumbnails fetch at once, and only once a card nears the
-  // viewport, so we don't blast Instagram/weserv with dozens of parallel
-  // requests (which is what was getting most of them throttled/blocked).
+  // --- Scroll-gated, one-at-a-time-per-slot loading ---
+  // A card is only built and inserted once its image has actually finished
+  // loading (no empty/placeholder boxes), a max of a few images are ever
+  // in flight at once, and nothing past the current scroll position is
+  // even attempted until the user scrolls near the bottom of what's shown.
   const MAX_CONCURRENT = 3;
   const RETRY_DELAY_MS = 1500;
+
+  let cursor = 0;
   let activeLoads = 0;
-  const loadQueue = [];
+  let loadedCount = 0;
+  let nearBottom = false;
 
-  function pumpQueue(){
-    while (activeLoads < MAX_CONCURRENT && loadQueue.length){
-      const task = loadQueue.shift();
-      activeLoads++;
-      task().finally(() => { activeLoads--; pumpQueue(); });
-    }
+  function updateCount(){
+    COUNT.textContent = `Loaded ${loadedCount} of ${items.length} posts`;
   }
-  function enqueueLoad(task){
-    loadQueue.push(task);
-    pumpQueue();
-  }
+  updateCount();
 
-  function loadThumb(it, thumb, card, attempt = 0){
+  function preloadImage(it, attempt = 0){
     return new Promise((resolve) => {
-      const img = document.createElement('img');
-      img.loading = 'lazy';
-      img.alt = '';
-      img.onload = () => {
-        thumb.innerHTML = '';
-        thumb.appendChild(img);
-        resolve();
-      };
+      const img = new Image();
+      img.onload = () => resolve(img);
       img.onerror = () => {
         if (attempt < 1){
-          setTimeout(() => { loadThumb(it, thumb, card, attempt + 1).then(resolve); }, RETRY_DELAY_MS);
+          setTimeout(() => preloadImage(it, attempt + 1).then(resolve), RETRY_DELAY_MS);
         } else {
-          thumb.classList.add('broken');
-          thumb.textContent = 'Image unavailable';
-          resolve();
+          resolve(null); // give up on this one post; doesn't affect the rest
         }
       };
       img.src = it.imgSrc;
     });
   }
 
-  const io = new IntersectionObserver((entries) => {
-    for (const entry of entries){
-      if (!entry.isIntersecting) continue;
-      io.unobserve(entry.target);
-      const { it, thumb, card } = entry.target._data;
-      enqueueLoad(() => loadThumb(it, thumb, card));
-    }
-  }, { rootMargin: '600px 0px' });
-
-  // Render grid
-  const frag = document.createDocumentFragment();
-  for (const it of items) {
+  function buildCard(it, img){
     const card = document.createElement('div');
     card.className = 'card';
 
@@ -201,7 +170,8 @@
     link.href = it.url;
     link.target = '_blank';
     link.rel = 'noopener';
-    link._data = { it, thumb: link, card };
+    img.alt = '';
+    link.appendChild(img);
     card.appendChild(link);
 
     const meta = document.createElement('div');
@@ -224,15 +194,33 @@
     meta.appendChild(handleEl);
     meta.appendChild(open);
     card.appendChild(meta);
-
-    wireMasonryObservers(card);
-    io.observe(link);
-    frag.appendChild(card);
+    return card;
   }
 
-  GRID.appendChild(frag);
-  // Final pass to ensure correct spans
-  GRID.querySelectorAll('.card').forEach(resizeCard);
+  function startNext(){
+    while (nearBottom && activeLoads < MAX_CONCURRENT && cursor < items.length){
+      const it = items[cursor++];
+      activeLoads++;
+      preloadImage(it).then((img) => {
+        activeLoads--;
+        if (img){
+          const card = buildCard(it, img);
+          GRID.appendChild(card);
+          wireMasonryObservers(card);
+          loadedCount++;
+          updateCount();
+        }
+        startNext();
+      });
+    }
+  }
+
+  const io = new IntersectionObserver((entries) => {
+    nearBottom = entries[entries.length - 1].isIntersecting;
+    if (nearBottom) startNext();
+  }, { rootMargin: '800px 0px' });
+  io.observe(SENTINEL);
+
   window.addEventListener('resize', () => GRID.querySelectorAll('.card').forEach(resizeCard));
 })();
 </script>
