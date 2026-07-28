@@ -41,6 +41,9 @@
   .controls{ display:flex; align-items:center; gap:12px; }
   input[type="range"]{ width:180px; }
   .warn{ color:#b45; font-size:12px; }
+  .loader{ display:none; align-items:center; justify-content:center; gap:8px; padding:24px 0; color:#888; font-size:13px; }
+  .spinner{ width:16px; height:16px; border:2px solid #ddd; border-top-color:#888; border-radius:50%; animation:spin .8s linear infinite; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
 </style>
 
 <div class="topbar" style="display:none;">
@@ -51,6 +54,7 @@
 </div>
 
 <div class="masonry" id="grid" aria-live="polite"></div>
+<div id="loader" class="loader"><span class="spinner"></span> Loading more…</div>
 <div id="sentinel" style="height:1px;"></div>
 <div id="notes" class="muted" style="margin-top:10px;"></div>
 
@@ -74,7 +78,7 @@
     resizeCard(card);
   }
   const el = id => document.getElementById(id);
-  const COUNT = el('count'), GRID = el('grid'), GAP = el('gap'), NOTES = el('notes'), SENTINEL = el('sentinel');
+  const COUNT = el('count'), GRID = el('grid'), GAP = el('gap'), NOTES = el('notes'), SENTINEL = el('sentinel'), LOADER = el('loader');
 
   GAP.oninput = () =>
     document.documentElement.style.setProperty('--gap', GAP.value + 'px');
@@ -134,7 +138,6 @@
   // in flight at once, and nothing past the current scroll position is
   // even attempted until the user scrolls near the bottom of what's shown.
   const MAX_CONCURRENT = 3;
-  const RETRY_DELAY_MS = 1500;
 
   let cursor = 0;
   let activeLoads = 0;
@@ -146,17 +149,19 @@
   }
   updateCount();
 
-  function preloadImage(it, attempt = 0){
+  function updateLoader(){
+    LOADER.style.display = activeLoads > 0 ? 'flex' : 'none';
+  }
+
+  function preloadImage(it){
+    // No retry here: a failed weserv fetch for a given post is a hard,
+    // deterministic 404 (confirmed by re-requesting the same URL multiple
+    // times), not a transient hiccup — retrying just burns time for no
+    // benefit. Skip it immediately and move on.
     return new Promise((resolve) => {
       const img = new Image();
       img.onload = () => resolve(img);
-      img.onerror = () => {
-        if (attempt < 1){
-          setTimeout(() => preloadImage(it, attempt + 1).then(resolve), RETRY_DELAY_MS);
-        } else {
-          resolve(null); // give up on this one post; doesn't affect the rest
-        }
-      };
+      img.onerror = () => resolve(null); // give up on this one post; doesn't affect the rest
       img.src = it.imgSrc;
     });
   }
@@ -206,6 +211,7 @@
     while (nearBottom && activeLoads < MAX_CONCURRENT && cursor < items.length){
       const it = items[cursor++];
       activeLoads++;
+      updateLoader();
       preloadImage(it).then((img) => {
         activeLoads--;
         if (img){
@@ -215,6 +221,7 @@
           loadedCount++;
           updateCount();
         }
+        updateLoader();
         startNext();
       });
     }
