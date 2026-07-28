@@ -41,6 +41,9 @@
   .controls{ display:flex; align-items:center; gap:12px; }
   input[type="range"]{ width:180px; }
   .warn{ color:#b45; font-size:12px; }
+  .loader{ display:none; align-items:center; justify-content:center; gap:8px; padding:24px 0; color:#888; font-size:13px; }
+  .spinner{ width:16px; height:16px; border:2px solid #ddd; border-top-color:#888; border-radius:50%; animation:spin .8s linear infinite; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
 </style>
 
 <div class="topbar" style="display:none;">
@@ -51,6 +54,7 @@
 </div>
 
 <div class="masonry" id="grid" aria-live="polite"></div>
+<div id="loader" class="loader"><span class="spinner"></span> Loading more…</div>
 <div id="sentinel" style="height:1px;"></div>
 <div id="notes" class="muted" style="margin-top:10px;"></div>
 
@@ -74,7 +78,7 @@
     resizeCard(card);
   }
   const el = id => document.getElementById(id);
-  const COUNT = el('count'), GRID = el('grid'), GAP = el('gap'), NOTES = el('notes'), SENTINEL = el('sentinel');
+  const COUNT = el('count'), GRID = el('grid'), GAP = el('gap'), NOTES = el('notes'), SENTINEL = el('sentinel'), LOADER = el('loader');
 
   GAP.oninput = () =>
     document.documentElement.style.setProperty('--gap', GAP.value + 'px');
@@ -147,6 +151,10 @@
   }
   updateCount();
 
+  function updateLoader(){
+    LOADER.style.display = activeLoads > 0 ? 'flex' : 'none';
+  }
+
   function preloadImage(it, attempt = 0){
     return new Promise((resolve) => {
       const img = new Image();
@@ -199,14 +207,15 @@
   }
 
   function startNext(){
-    // Only fetches while the sentinel (bottom of what's currently loaded)
-    // is actually inside the viewport — nothing off-screen ever gets
-    // requested ahead of time. This still fills the initial visible
-    // screen on page load, since the sentinel starts out in view when
-    // the grid is empty; it then pauses until you scroll further.
+    // Fetches while the sentinel (bottom of what's currently loaded) is
+    // within a screen-ish of the viewport — a small head start so images
+    // are usually ready by the time you scroll to them, not the instant
+    // they're visible. Still capped at MAX_CONCURRENT in flight, so this
+    // is "load a little ahead," not "load everything ahead."
     while (nearBottom && activeLoads < MAX_CONCURRENT && cursor < items.length){
       const it = items[cursor++];
       activeLoads++;
+      updateLoader();
       preloadImage(it).then((img) => {
         activeLoads--;
         if (img){
@@ -216,6 +225,7 @@
           loadedCount++;
           updateCount();
         }
+        updateLoader();
         startNext();
       });
     }
@@ -224,7 +234,7 @@
   const io = new IntersectionObserver((entries) => {
     nearBottom = entries[entries.length - 1].isIntersecting;
     if (nearBottom) startNext();
-  }, { rootMargin: '0px' });
+  }, { rootMargin: '600px 0px' });
   io.observe(SENTINEL);
 
   window.addEventListener('resize', () => GRID.querySelectorAll('.card').forEach(resizeCard));
