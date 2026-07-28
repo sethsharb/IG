@@ -198,6 +198,11 @@
   }
 
   function startNext(){
+    // Only fetches while the sentinel (bottom of what's currently loaded)
+    // is actually inside the viewport — nothing off-screen ever gets
+    // requested ahead of time. This still fills the initial visible
+    // screen on page load, since the sentinel starts out in view when
+    // the grid is empty; it then pauses until you scroll further.
     while (nearBottom && activeLoads < MAX_CONCURRENT && cursor < items.length){
       const it = items[cursor++];
       activeLoads++;
@@ -218,7 +223,7 @@
   const io = new IntersectionObserver((entries) => {
     nearBottom = entries[entries.length - 1].isIntersecting;
     if (nearBottom) startNext();
-  }, { rootMargin: '800px 0px' });
+  }, { rootMargin: '0px' });
   io.observe(SENTINEL);
 
   window.addEventListener('resize', () => GRID.querySelectorAll('.card').forEach(resizeCard));
