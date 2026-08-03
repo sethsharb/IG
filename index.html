@@ -12,14 +12,10 @@
   }
   .topbar{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
   .muted{ color:#666 }
-  /* .masonry{ column-width:260px; column-gap:var(--gap); } */
-  /* @media (max-width:900px){ .masonry{ column-width:200px; } } */
-  /* @media (max-width:640px){ .masonry{ column-width:160px; } } */
   /* Masonry using CSS Grid with JS-calculated row spans (stable order) */
   .masonry{
     display:grid;
     grid-template-columns: repeat(4, 1fr); /* 4 columns on widest */
-    /* grid-auto-rows: 8px;  */
     gap: var(--gap);
     align-items:start; /* prevent stretch */
   }
@@ -32,8 +28,20 @@
     .masonry{ grid-template-columns: repeat(2, 1fr); }
   }
   .card{ break-inside:avoid; margin:0 0; background:#fff; border:1px solid #eee; border-radius:12px; overflow:hidden; box-shadow:0 1px 2px rgba(0,0,0,.04); }
-  .thumb{ display:block; background:#eee; }
-  .thumb img{ display:block; width:100%; height:auto; }
+
+  /* The thumbnail is an Instagram embed with its header/footer clipped away,
+     so only the photo itself shows. The iframe is rendered at EMBED_W (the
+     narrowest width Instagram's embed lays out cleanly) and scaled down to
+     the tile width. */
+  .thumb{ display:block; position:relative; overflow:hidden; background:#eee; }
+  .thumb iframe{
+    position:absolute; top:0; left:0; border:0;
+    transform-origin:0 0;
+    pointer-events:none; /* clicks go to the overlay link instead */
+  }
+  /* Transparent click target so the whole photo still opens the post. */
+  .thumb .hit{ position:absolute; inset:0; z-index:1; }
+
   .meta{ padding:8px 10px; font-size:14px; color:#555; display:flex; justify-content:space-between; align-items:center; gap:10px; }
   .meta a{ color:inherit; text-decoration:none; }
   .meta a:hover{ text-decoration:underline; }
@@ -44,6 +52,8 @@
   .loader{ display:none; align-items:center; justify-content:center; gap:8px; padding:24px 0; color:#888; font-size:13px; }
   .spinner{ width:16px; height:16px; border:2px solid #ddd; border-top-color:#888; border-radius:50%; animation:spin .8s linear infinite; }
   @keyframes spin{ to{ transform:rotate(360deg); } }
+  /* Where embeds are measured before being placed in the grid. */
+  #stage{ position:absolute; left:-10000px; top:0; width:1px; height:1px; overflow:hidden; }
 </style>
 
 <div class="topbar" style="display:none;">
@@ -57,9 +67,32 @@
 <div id="loader" class="loader"><span class="spinner"></span> Loading more…</div>
 <div id="sentinel" style="height:1px;"></div>
 <div id="notes" class="muted" style="margin-top:10px;"></div>
+<div id="stage"></div>
 
 <script>
 (async () => {
+  // Photos come from Instagram's official embed (instagram.com/p/<code>/embed/),
+  // with the embed's header, like bar and "View more on Instagram" footer
+  // clipped off so only the photo shows.
+  //
+  // Why not just use <img>: Instagram serves cross-origin-resource-policy:
+  // same-origin on its CDN, so browsers refuse to render its images on another
+  // site. It also 404s /media/?size=l for cross-site requests (it checks the
+  // Sec-Fetch-Site header). The images.weserv.nl proxy used to sidestep both,
+  // but Instagram now blocks that proxy's servers, which is why the grid
+  // filled up with 404s. Embeds are the supported route and aren't rate
+  // limited, since Instagram is serving its own frames.
+  //
+  // Geometry (measured, stable across widths):
+  //   header  = 54px, footer = 154px
+  //   Instagram posts {type:"MEASURE", details:{height}} to us via postMessage,
+  //   so photo height = height - 208 at EMBED_W wide.
+  const EMBED_W = 326;   // narrowest width the embed lays out cleanly
+  const HEADER  = 54;
+  const FOOTER  = 154;
+  const MAX_CONCURRENT = 3;
+  const MEASURE_TIMEOUT_MS = 15000;
+
   // --- Masonry sizing helpers (stable order) ---
   function resizeCard(card){
     const grid = document.getElementById('grid');
@@ -71,14 +104,17 @@
     card.style.gridRowEnd = 'span ' + span;
   }
   function wireMasonryObservers(card){
-    // Card is only ever appended once its image has finished loading,
-    // so we can size it immediately and just watch for later changes.
+    // Cards are only added once their photo has loaded and been measured,
+    // so size immediately and just watch for later changes.
     const ro = new ResizeObserver(() => resizeCard(card));
     ro.observe(card);
     resizeCard(card);
   }
+
   const el = id => document.getElementById(id);
-  const COUNT = el('count'), GRID = el('grid'), GAP = el('gap'), NOTES = el('notes'), SENTINEL = el('sentinel'), LOADER = el('loader');
+  const COUNT = el('count'), GRID = el('grid'), GAP = el('gap'),
+        NOTES = el('notes'), SENTINEL = el('sentinel'), LOADER = el('loader'),
+        STAGE = el('stage');
 
   GAP.oninput = () =>
     document.documentElement.style.setProperty('--gap', GAP.value + 'px');
@@ -97,8 +133,8 @@
   for (const rawLine of lines) {
     // Normalize spaces and @ variants
     const line = rawLine
-      .replace(/\u00A0/g, ' ')          // non-breaking space → space
-      .replace(/[\ufe6a\uff20]/g, '@')  // fullwidth/small @ → normal @
+      .replace(/ /g, ' ')          // non-breaking space -> space
+      .replace(/[﹪＠]/g, '@')  // fullwidth/small @ -> normal @
       .replace(/\s+/g, ' ')
       .trim();
 
@@ -108,76 +144,100 @@
     const url = urlMatch[0].split('?')[0].replace(/\/?$/, '/');
 
     // Handle = first @username anywhere on the line
-    // (Instagram allows a–z, 0–9, dot, underscore; up to 30 chars)
+    // (Instagram allows a-z, 0-9, dot, underscore; up to 30 chars)
     const hMatch = line.match(/@([A-Za-z0-9._]{1,30})/);
     const handle = hMatch ? hMatch[1] : '';
 
     if (handle) withHandle++; else withoutHandle++;
 
-    // We only know the image trick for /p/ posts
+    // Embeds only exist for /p/ posts
     const pm = url.match(/instagram\.com\/(p)\/([^\/?#]+)/i);
-    if (!pm) {
-      // If you want to show text-only cards for reels/tv, we can add that later.
-      continue;
-    }
-    const code = pm[2];
-    const imgSrc = 'https://images.weserv.nl/?url=' +
-      encodeURIComponent('instagram.com/p/' + code + '/media/?size=l') +
-      '&n=-1';
+    if (!pm) continue;
 
-    items.push({ url, handle, imgSrc });
+    items.push({ url, handle, code: pm[2] });
   }
 
   if (withoutHandle && withHandle === 0) {
     NOTES.innerHTML = '<span class="warn">All entries appear to be missing a recognizable "@handle" token on each line. Make sure each line looks like:<br><code>https://www.instagram.com/p/XXXX/ @username</code></span>';
   }
 
-  // --- Scroll-gated, one-at-a-time-per-slot loading ---
-  // A card is only built and inserted once its image has actually finished
-  // loading (no empty/placeholder boxes), a max of a few images are ever
-  // in flight at once, and nothing past the current scroll position is
-  // even attempted until the user scrolls near the bottom of what's shown.
-  const MAX_CONCURRENT = 3;
+  // --- Listen for the height Instagram reports for each embed ---
+  // Instagram posts MEASURE before the iframe's load event fires, so we can't
+  // register the handler in onload — we look the frame up by its contentWindow
+  // when the message actually arrives.
+  const waiting = new Set(); // iframes currently being measured
+  window.addEventListener('message', (e) => {
+    let host;
+    try { host = new URL(e.origin).hostname; } catch(_) { return; }
+    if (!/(^|\.)instagram\.com$/.test(host)) return;
+    let d = e.data;
+    if (typeof d === 'string') { try { d = JSON.parse(d); } catch(_) { return; } }
+    if (!d || d.type !== 'MEASURE' || !d.details || !d.details.height) return;
+    for (const frame of waiting){
+      if (frame.contentWindow === e.source){
+        if (frame._measured) frame._measured(d.details.height);
+        break;
+      }
+    }
+  });
 
-  let cursor = 0;
-  let activeLoads = 0;
-  let loadedCount = 0;
-  let nearBottom = false;
-
-  function updateCount(){
-    COUNT.textContent = `Loaded ${loadedCount} of ${items.length} posts`;
-  }
-  updateCount();
-
-  function updateLoader(){
-    LOADER.style.display = activeLoads > 0 ? 'flex' : 'none';
-  }
-
-  function preloadImage(it){
-    // No retry here: a failed weserv fetch for a given post is a hard,
-    // deterministic 404 (confirmed by re-requesting the same URL multiple
-    // times), not a transient hiccup — retrying just burns time for no
-    // benefit. Skip it immediately and move on.
+  // Load one embed offscreen and wait for its measurement, so we never put an
+  // empty box in the grid and always know the photo's true height.
+  function measureEmbed(it){
     return new Promise((resolve) => {
-      const img = new Image();
-      img.onload = () => resolve(img);
-      img.onerror = () => resolve(null); // give up on this one post; doesn't affect the rest
-      img.src = it.imgSrc;
+      const frame = document.createElement('iframe');
+      frame.setAttribute('scrolling', 'no');
+      frame.setAttribute('loading', 'eager');
+      frame.style.cssText = 'width:' + EMBED_W + 'px;height:1400px;border:0;';
+      let settled = false;
+      const finish = (photoH) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        waiting.delete(frame);
+        resolve(photoH ? { frame, photoH } : null);
+        if (!photoH) frame.remove();
+      };
+      const timer = setTimeout(() => finish(null), MEASURE_TIMEOUT_MS);
+      frame._measured = (total) => {
+        const photoH = total - HEADER - FOOTER;
+        finish(photoH > 0 ? photoH : null);
+      };
+      frame.onerror = () => finish(null);
+      waiting.add(frame);
+      STAGE.appendChild(frame);
+      frame.src = 'https://www.instagram.com/p/' + it.code + '/embed/';
     });
   }
 
-  function buildCard(it, img){
+  function buildCard(it, frame, photoH){
     const card = document.createElement('div');
     card.className = 'card';
 
-    const link = document.createElement('a');
-    link.className = 'thumb';
-    link.href = it.url;
-    link.target = '_blank';
-    link.rel = 'noopener';
-    img.alt = '';
-    link.appendChild(img);
-    card.appendChild(link);
+    const thumb = document.createElement('div');
+    thumb.className = 'thumb';
+
+    // Scale the 326px-wide embed down to whatever the column width is, and
+    // shift it up by the header so the photo starts at the top of the tile.
+    const setGeometry = () => {
+      const w = thumb.clientWidth || GRID.clientWidth / 4;
+      const scale = w / EMBED_W;
+      frame.style.transform = 'scale(' + scale + ') translateY(' + (-HEADER) + 'px)';
+      thumb.style.height = (photoH * scale) + 'px';
+    };
+    frame.style.width = EMBED_W + 'px';
+    frame.style.height = (HEADER + photoH + FOOTER) + 'px';
+    thumb.appendChild(frame);
+
+    // Transparent link over the photo keeps the old click behaviour.
+    const hit = document.createElement('a');
+    hit.className = 'hit';
+    hit.href = it.url;
+    hit.target = '_blank';
+    hit.rel = 'noopener';
+    hit.setAttribute('aria-label', it.handle ? ('Open post by @' + it.handle) : 'Open post');
+    thumb.appendChild(hit);
+    card.appendChild(thumb);
 
     const meta = document.createElement('div');
     meta.className = 'meta';
@@ -199,24 +259,36 @@
     meta.appendChild(handleEl);
     meta.appendChild(open);
     card.appendChild(meta);
+
+    card._setGeometry = setGeometry;
     return card;
   }
 
+  // --- Scroll-gated loading ---
+  // Nothing is requested until the sentinel (the bottom of what's already
+  // loaded) reaches the viewport, and only a few embeds load at a time.
+  let cursor = 0, activeLoads = 0, loadedCount = 0, nearBottom = false;
+
+  function updateCount(){
+    COUNT.textContent = `Loaded ${loadedCount} of ${items.length} posts`;
+  }
+  updateCount();
+
+  function updateLoader(){
+    LOADER.style.display = activeLoads > 0 ? 'flex' : 'none';
+  }
+
   function startNext(){
-    // Only fetches while the sentinel (bottom of what's currently loaded)
-    // is actually inside the viewport — nothing off-screen ever gets
-    // requested ahead of time. This still fills the initial visible
-    // screen on page load, since the sentinel starts out in view when
-    // the grid is empty; it then pauses until you scroll further.
     while (nearBottom && activeLoads < MAX_CONCURRENT && cursor < items.length){
       const it = items[cursor++];
       activeLoads++;
       updateLoader();
-      preloadImage(it).then((img) => {
+      measureEmbed(it).then((r) => {
         activeLoads--;
-        if (img){
-          const card = buildCard(it, img);
+        if (r){
+          const card = buildCard(it, r.frame, r.photoH);
           GRID.appendChild(card);
+          card._setGeometry();
           wireMasonryObservers(card);
           loadedCount++;
           updateCount();
@@ -230,9 +302,14 @@
   const io = new IntersectionObserver((entries) => {
     nearBottom = entries[entries.length - 1].isIntersecting;
     if (nearBottom) startNext();
-  }, { rootMargin: '0px' });
+  }, { rootMargin: '600px 0px' });
   io.observe(SENTINEL);
 
-  window.addEventListener('resize', () => GRID.querySelectorAll('.card').forEach(resizeCard));
+  window.addEventListener('resize', () => {
+    GRID.querySelectorAll('.card').forEach(c => {
+      if (c._setGeometry) c._setGeometry();
+      resizeCard(c);
+    });
+  });
 })();
 </script>
