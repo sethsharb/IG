@@ -90,7 +90,11 @@
   const EMBED_W = 326;   // narrowest width the embed lays out cleanly
   const HEADER  = 54;
   const FOOTER  = 154;
-  const MAX_CONCURRENT = 3;
+  // Embeds aren't rate limited the way the old scraped endpoint was: firing 24
+  // at once measured 22/22 live posts in under 1.7s (the other 2 were deleted
+  // posts). So this cap is about browser memory — each tile is an iframe — not
+  // about staying under an Instagram limit.
+  const MAX_CONCURRENT = 8;
   const MEASURE_TIMEOUT_MS = 15000;
 
   // --- Masonry sizing helpers (stable order) ---
@@ -302,7 +306,7 @@
   const io = new IntersectionObserver((entries) => {
     nearBottom = entries[entries.length - 1].isIntersecting;
     if (nearBottom) startNext();
-  }, { rootMargin: '600px 0px' });
+  }, { rootMargin: '1200px 0px' });
   io.observe(SENTINEL);
 
   window.addEventListener('resize', () => {
